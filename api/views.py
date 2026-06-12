@@ -1,5 +1,7 @@
 from typing import Optional
-
+from django.db import IntegrityError
+from rest_framework.response import Response
+from rest_framework import status
 from django.db.models import Prefetch, Q
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status
@@ -49,9 +51,9 @@ def _build_token_response(user: User):
     serialized = UserSerializer(user).data
     return {
         "id": serialized["id"],
-        "name": f"{user.first_name} {user.last_name}".strip() or user.email,
+        "name": f"{user.first_name} {user.last_name}".strip() or user.username or user.email,
         "email": user.email,
-        "registration_number": serialized.get("registration_number"),
+        "registration_number": user.registration_number,
         "role": serialized["role"],
         "token": str(refresh.access_token),
     }
@@ -100,10 +102,27 @@ class AdminRegisterView(APIView):
     def post(self, request):
         serializer = AdminRegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-        data = _build_token_response(user)
-        return Response(data, status=status.HTTP_201_CREATED)
 
+        try:
+            user = serializer.save()
+            data = _build_token_response(user)  # Your existing helper
+            return Response(data, status=status.HTTP_201_CREATED)
+        except IntegrityError as e:
+            error_msg = str(e)
+            if 'username' in error_msg:
+                return Response(
+                    {'error': 'Username already exists. Please choose another.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            elif 'email' in error_msg:
+                return Response(
+                    {'error': 'Email already registered.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            return Response(
+                {'error': 'Registration failed. Please try again.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
 class AdminLoginView(APIView):
     permission_classes = [permissions.AllowAny]
@@ -282,7 +301,23 @@ class LecturerTaskListCreateView(APIView):
         )
         serializer = TaskSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save(lecturer=lecturer)
+        task = serializer.save(lecturer=lecturer)
+
+        # Create notification for the CR if assigned and send_to_crs is true
+        if task.monitor and task.send_to_crs:
+            message = f"Lecturer {lecturer.get_full_name() or lecturer.email} has assigned a new task: {task.title}"
+            if task.notes:
+                message += f"\n\nNotes: {task.notes}"
+
+            Notification.objects.create(
+                user=task.monitor,
+                role=User.Role.MONITOR,
+                title="New Task Assigned",
+                message=message,
+                related_type=Notification.RelatedType.TASK,
+                related_id=task.id
+            )
+
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -382,6 +417,13 @@ class LecturerListView(generics.ListAPIView):
 
     def get_queryset(self):
         return User.objects.filter(role=User.Role.LECTURER)
+
+
+class MonitorListView(generics.ListAPIView):
+    serializer_class = UserSerializer
+
+    def get_queryset(self):
+        return User.objects.filter(role=User.Role.MONITOR)
 
 
 class IsAdminUserRole(permissions.BasePermission):
@@ -767,42 +809,67 @@ class MonitorYearOfStudyCreateView(APIView):
         bad = _ensure_monitor_self(request, monitor_id)
         if bad is not None:
             return bad
+
         monitor = get_object_or_404(User, id=monitor_id, role=User.Role.MONITOR)
         if not monitor.programme_id:
             return Response(
-                {"detail": "Select a programme first."},
+                {"detail": "Select a programme in your profile first."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
         serializer = MonitorYearOfStudyCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        semester = get_object_or_404(
-            Semester, id=serializer.validated_data["semester_id"]
-        )
+
+        semester_id = serializer.validated_data["semester_id"]
+        semester = get_object_or_404(Semester, id=semester_id)
+
+        # Validation checks
         if semester.monitor_id != monitor.id:
             return Response(
-                {"detail": "Semester not found for this account."},
-                status=status.HTTP_404_NOT_FOUND,
+                {"detail": "This semester does not belong to your account."},
+                status=status.HTTP_403_FORBIDDEN,
             )
-        if semester.course.programme_id != monitor.programme_id:
+
+        if not semester.course:
             return Response(
-                {"detail": "Semester does not belong to your programme."},
+                {"detail": "Semester is not linked to a valid course/programme."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
         yname = serializer.validated_data["name"].strip()
         if not yname:
             return Response(
-                {"detail": "Year of study name is required."},
+                {"detail": "Year of study name cannot be empty."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        year = YearOfStudy.objects.create(
-            name=yname,
-            programme=monitor.programme,
-            course=semester.course,
-            semester=semester,
-            monitor=monitor,
-        )
-        return Response(
-            {"id": year.id, "name": year.name, "semester_id": year.semester_id},
-            status=status.HTTP_201_CREATED,
-        )
+
+        try:
+            # Create the YearOfStudy
+            year = YearOfStudy.objects.create(
+                name=yname,
+                programme=monitor.programme,
+                course=semester.course,
+                semester=semester,
+                monitor=monitor,
+            )
+
+            # Update the Semester to point to this YearOfStudy
+            # This is optional but kept for your current model design
+            semester.year_of_study = year
+            semester.save(update_fields=['year_of_study'])
+
+            return Response(
+                {
+                    "id": year.id,
+                    "name": year.name,
+                    "semester_id": year.semester_id,
+                    "course_id": year.course_id
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        except Exception as e:
+            return Response(
+                {"detail": f"Database error: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 

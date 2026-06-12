@@ -1,5 +1,8 @@
 from django.contrib.auth import authenticate
 from rest_framework import serializers
+from django.contrib.auth.hashers import make_password
+from rest_framework.exceptions import ValidationError
+from rest_framework.validators import UniqueValidator
 
 from .models import (
     User,
@@ -41,16 +44,7 @@ class AdminUserCreateUpdateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = [
-            "id",
-            "first_name",
-            "last_name",
-            "email",
-            "role",
-            "registration_number",
-            "programme",
-            "password",
-        ]
+        fields = ['id', 'first_name', 'last_name', 'role', 'email', 'password', 'registration_number', 'programme']
 
     def validate(self, attrs):
         role = attrs.get("role", getattr(self.instance, "role", None))
@@ -106,12 +100,12 @@ class LecturerLoginSerializer(serializers.Serializer):
         email = attrs.get("email")
         password = attrs.get("password")
 
-        try:
-            user = User.objects.get(email=email, role=User.Role.LECTURER)
-        except User.DoesNotExist:
-            raise serializers.ValidationError("Invalid credentials.", code="authorization")
+        # First, try to get by email. If that fails, try by username.
+        user = User.objects.filter(email=email, role=User.Role.LECTURER).first()
+        if not user:
+            user = User.objects.filter(username=email, role=User.Role.LECTURER).first()
 
-        if not user.check_password(password):
+        if not user or not user.check_password(password):
             raise serializers.ValidationError("Invalid credentials.", code="authorization")
 
         attrs["user"] = user
@@ -126,12 +120,12 @@ class MonitorLoginSerializer(serializers.Serializer):
         reg = attrs.get("registration_number")
         password = attrs.get("password")
 
-        try:
-            user = User.objects.get(registration_number=reg, role=User.Role.MONITOR)
-        except User.DoesNotExist:
-            raise serializers.ValidationError("Invalid credentials.", code="authorization")
+        # Try to get by registration_number. If that fails, try by username.
+        user = User.objects.filter(registration_number=reg, role=User.Role.MONITOR).first()
+        if not user:
+            user = User.objects.filter(username=reg, role=User.Role.MONITOR).first()
 
-        if not user.check_password(password):
+        if not user or not user.check_password(password):
             raise serializers.ValidationError("Invalid credentials.", code="authorization")
 
         attrs["user"] = user
@@ -158,22 +152,32 @@ class AdminLoginSerializer(serializers.Serializer):
         return attrs
 
 
+
 class AdminRegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, min_length=8)
 
     class Meta:
         model = User
-        fields = [
-            "id",
-            "first_name",
-            "last_name",
-            "email",
-            "password",
-        ]
+        fields = ['id', 'username', 'first_name', 'last_name', 'email', 'password']
+        extra_kwargs = {
+            'username': {'required': True},  # ← Make username required
+            'email': {'required': True},
+        }
+
+    def validate_username(self, value):
+        """Check if username already exists"""
+        if User.objects.filter(username=value).exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return value
+
+    def validate_email(self, value):
+        """Check if email already exists"""
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError("This email is already registered.")
+        return value
 
     def create(self, validated_data):
         password = validated_data.pop("password")
-        # Always create an ADMIN user here
         user = User(role=User.Role.ADMIN, **validated_data)
         user.set_password(password)
         user.save()
@@ -350,6 +354,7 @@ class TaskSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "lecturer",
+            "monitor",
             "title",
             "type",
             "class_group",

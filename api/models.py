@@ -178,9 +178,8 @@ class Timetable(models.Model):
 
 class Task(models.Model):
     class TaskType(models.TextChoices):
-        TEST = "Test", "Test"
-        QUIZ = "Quiz", "Quiz"
-        ASSIGNMENT = "Assignment", "Assignment"
+        INDIVIDUAL = "Individual Assignment", "Individual Assignment"
+        GROUP = "Group Assignment", "Group Assignment"
         OTHER = "Other", "Other"
 
     lecturer = models.ForeignKey(
@@ -189,8 +188,16 @@ class Task(models.Model):
         related_name="tasks",
         limit_choices_to={"role": User.Role.LECTURER},
     )
+    monitor = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="assigned_tasks",
+        limit_choices_to={"role": User.Role.MONITOR},
+        null=True,
+        blank=True,
+    )
     title = models.CharField(max_length=255)
-    type = models.CharField(max_length=16, choices=TaskType.choices)
+    type = models.CharField(max_length=32, choices=TaskType.choices)
     class_group = models.ForeignKey(
         ClassGroup, on_delete=models.CASCADE, related_name="tasks", null=True, blank=True
     )
